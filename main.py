@@ -11,6 +11,7 @@ from pprint import pprint
 from parallel_utils import map_layers_to_multi_gpus, get_lowest_occupied_gpu
 import torch.nn as nn
 from quantize.omniquant import omniquant
+from quantize.omnisparse import omnisparse
 from tqdm import tqdm
 import utils
 from pathlib import Path
@@ -232,6 +233,8 @@ def main():
     parser.add_argument("--net", type=str, default=None, choices=net_choices)
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
+    parser.add_argument("--sparsity-ratio", type=float, default=0.5)
+    parser.add_argument("--sparse", default=False, action="store_true")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -342,15 +345,27 @@ def main():
         if args.let:
             act_scales = torch.load(args.act_scales)
             act_shifts = torch.load(args.act_shifts)
-        omniquant(
+        if args.sparse:
+            
+            omnisparse(
+                lm,
+                args,
+                dataloader,
+                act_scales,
+                act_shifts,
+                logger,
+            )
+            logger.info(time.time() - tick)
+        else:
+            omniquant(
             lm,
             args,
             dataloader,
             act_scales,
             act_shifts,
             logger,
-        )
-        logger.info(time.time() - tick)
+            )
+            logger.info(time.time() - tick)
     if args.save_dir:
         # delete omni parameters
         for name, module in lm.model.named_modules():

@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_opt_layer import QuantOPTDecoderLayer
+from models.sparse_opt_layer import SparseOPTDecoderLayer
 from models.int_falcon_layer import QuantFalconDecoderLayer
 from quantize.int_linear import QuantLinear
+from quantize.sparse_linear import SparseLinear
 from contextlib import nullcontext
 import copy
 import math
@@ -13,7 +15,7 @@ import pdb
 import gc
 from quantize.utils import let_parameters, lwc_parameters, get_omni_parameters,\
                             omni_state_dict, register_scales_and_zeros,smooth_and_quant_temporary,\
-                            smooth_and_quant_inplace,clear_temp_variable,set_quant_state
+                            smooth_and_quant_inplace,clear_temp_variable,set_sparse_state, sparse_parameters
 try:
     import auto_gptq.nn_modules.qlinear.qlinear_cuda as qlinear_cuda
     import auto_gptq.nn_modules.qlinear.qlinear_triton as qlinear_triton
@@ -39,7 +41,7 @@ def add_new_module(name, original_module, added_module):
     else:
         setattr(original_module, name, added_module)     
 
-def omniquant(
+def omnisparse(
     lm,
     args,
     dataloader,
@@ -75,7 +77,7 @@ def omniquant(
             model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
         if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
             model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
-        DecoderLayer = QuantOPTDecoderLayer
+        DecoderLayer = SparseOPTDecoderLayer
         pairs = {
             "q_proj":"qkv",
             "out_proj":"out",
@@ -197,7 +199,7 @@ def omniquant(
             qlayer = copy.deepcopy(layer)
             for name, module in qlayer.named_modules():
                 if isinstance(module,torch.nn.Linear) and not "gate" in name:       # do not quantize gate
-                    quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
+                    quantlinear = SparseLinear(module, args.weight_quant_params, args.act_quant_params)
                     add_new_module(name, qlayer, quantlinear)    
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
@@ -205,7 +207,7 @@ def omniquant(
 
         
         # obtain output of full-precision model
-        set_quant_state(qlayer, weight_quant=False, act_quant=False)
+        set_sparse_state(qlayer, sparse=False)
         if args.epochs > 0:
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
@@ -214,27 +216,24 @@ def omniquant(
                         if args.aug_loss:
                             fp_inps_2[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
         # init smooth parameters
-        set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
-        qlayer.let = args.let
-        use_shift = True 
-        if is_llama or args.abits == 16:
-            use_shift = False                   # deactivate channel-wise shifting for llama model and weight-only quantization
-        if args.let:
-            # init channel-wise scaling and shift
-            qlayer.register_parameter("qkt_smooth_scale",torch.nn.Parameter(torch.ones(layer.self_attn.q_proj.out_features,device=dev, dtype=dtype)))
-            for name,module in qlayer.named_modules():
-                if isinstance(module, QuantLinear):
-                    for key in pairs.keys():
-                        if key in name:
-                            act = act_scales[f"{layer_name_prefix}.{i}.{name}"].to(device=dev, dtype=dtype).clamp(min=1e-5)
-                            weight = module.weight.abs().max(dim=0)[0].clamp(min=1e-5)
-                            scale = (act.pow(args.alpha)/weight.pow(1-args.alpha)).clamp(min=1e-5)
-                            if use_shift and not is_llama:
-                                shift = act_shifts[f"{layer_name_prefix}.{i}.{name}"].to(device=dev, dtype=dtype)
-                            else:
-                                shift = torch.zeros_like(scale)
-                            qlayer.register_parameter(f"{pairs[key]}_smooth_shift",torch.nn.Parameter(shift))
-                            qlayer.register_parameter(f"{pairs[key]}_smooth_scale",torch.nn.Parameter(scale))
+        # set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
+        qlayer.let = args.let       # deactivate channel-wise shifting for llama model and weight-only quantization
+        # if args.let:
+        #     # init channel-wise scaling and shift
+        #     qlayer.register_parameter("qkt_smooth_scale",torch.nn.Parameter(torch.ones(layer.self_attn.q_proj.out_features,device=dev, dtype=dtype)))
+        #     for name,module in qlayer.named_modules():
+        #         if isinstance(module, QuantLinear):
+        #             for key in pairs.keys():
+        #                 if key in name:
+        #                     act = act_scales[f"{layer_name_prefix}.{i}.{name}"].to(device=dev, dtype=dtype).clamp(min=1e-5)
+        #                     weight = module.weight.abs().max(dim=0)[0].clamp(min=1e-5)
+        #                     scale = (act.pow(args.alpha)/weight.pow(1-args.alpha)).clamp(min=1e-5)
+        #                     if use_shift and not is_llama:
+        #                         shift = act_shifts[f"{layer_name_prefix}.{i}.{name}"].to(device=dev, dtype=dtype)
+        #                     else:
+        #                         shift = torch.zeros_like(scale)
+        #                     qlayer.register_parameter(f"{pairs[key]}_smooth_shift",torch.nn.Parameter(shift))
+        #                     qlayer.register_parameter(f"{pairs[key]}_smooth_scale",torch.nn.Parameter(scale))
                                 
         if args.resume:
             qlayer.load_state_dict(omni_parameters[i], strict=False)
@@ -244,8 +243,10 @@ def omniquant(
             with torch.no_grad():
                 qlayer.float()      # required for AMP training
             # create optimizer
+            # import pdb; pdb.set_trace()
             optimizer = torch.optim.AdamW(
-                [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr}, {"params":lwc_parameters(qlayer),"lr":args.lwc_lr}],weight_decay=args.wd)
+                [{"params":sparse_parameters(qlayer),"lr":args.let_lr}],weight_decay=args.wd)
+            import pdb; pdb.set_trace()
             loss_scaler = utils.NativeScalerWithGradNormCount()
             
             for epochs in range(args.epochs):
@@ -255,19 +256,21 @@ def omniquant(
                     index = j * args.batch_size
                     # obtain output of quantization model
                     with traincast():
-                        smooth_and_quant_temporary(qlayer, args, is_llama)
+                        # smooth_and_quant_temporary(qlayer, args, is_llama)
+                        set_sparse_state(qlayer, sparse=False)
                         quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
-                        pdb.set_trace()
+                        # pdb.set_trace()
                         
                     loss_list.append(loss.detach().cpu())
                     optimizer.zero_grad()
+
                     import pdb; pdb.set_trace()
-                    norm = loss_scaler(loss, optimizer,parameters= get_omni_parameters(qlayer, use_shift)).cpu()
+                    norm = loss_scaler(loss, optimizer,parameters= sparse_parameters(qlayer)).cpu()
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
@@ -276,6 +279,7 @@ def omniquant(
             clear_temp_variable(qlayer)
             del optimizer
         qlayer.half() 
+        import pdb; pdb.set_trace()
         # real smooth and quantization
         smooth_and_quant_inplace(qlayer, args, is_llama)
         if args.epochs>0:
@@ -321,3 +325,4 @@ def omniquant(
     gc.collect()                    
     model.config.use_cache = use_cache
     return model
+

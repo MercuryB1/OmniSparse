@@ -1,9 +1,17 @@
 from collections import OrderedDict
 from quantize.int_linear import QuantLinear
+from quantize.sparse_linear import SparseLinear
 import torch
 from quantize.int_matmul import QuantMatMul
 from models.transformation import *
 
+
+def sparse_parameters(model):
+    params = []
+    for n, m in model.named_parameters():
+        if n.find('weight') > -1:
+            params.append(m)
+    return iter(params)
 
 def let_parameters(model, use_shift=True):
     params = []
@@ -142,3 +150,11 @@ def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
     for m in self.modules():
         if isinstance(m, (QuantLinear, QuantMatMul)):
             m.set_quant_state(weight_quant, act_quant)
+
+
+def set_sparse_state(self, sparse: bool = False):
+    # setting weight quantization here does not affect actual forward pass
+    self.use_weight_quant = sparse
+    for m in self.modules():
+        if isinstance(m, SparseLinear):
+            m.set_sparse_state(sparse)
